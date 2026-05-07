@@ -216,13 +216,13 @@ def create_thank_you_pdf(first_name: str, output_pdf_path: str):
     c.setTitle(f"Thank you {first_name}")
 
     left_margin = 10.32
-    max_width = 520.36
+    max_width = 525.36
     font_size = 52
 
-    handwriting.draw(c, title, left_margin, 300.22, font_size)
+    handwriting.draw(c, title, left_margin, 320.22, font_size)
 
-    y = 250.27
-    leading = 49.82
+    y = 260.27
+    leading = 50.82
     for paragraph in body:
         for line in wrap_text(
             paragraph,
