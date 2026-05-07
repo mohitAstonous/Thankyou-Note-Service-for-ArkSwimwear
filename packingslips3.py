@@ -5,10 +5,14 @@ from uuid import uuid4
 from docx import Document
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fontTools.pens.basePen import BasePen
+from fontTools.ttLib import TTFont as OpenTypeFont
 from pydantic import BaseModel
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
+import uharfbuzz as hb
 
 
 app = FastAPI(title="Ark Swimwear Thank You Note Service")
@@ -17,8 +21,24 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "generated_output")
 TEMPLATE_DOCX = os.path.join(BASE_DIR, "mailmerge.docx")
 HANDWRITING_FONT = os.path.join(BASE_DIR, "Reneeshandwriting-Regular (2).otf")
+ARK_LOGO = os.path.join(BASE_DIR, "Ark Swimwear Sydney Australia Logo@3x.png")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+WORD_HANDWRITING_FEATURES = {
+    # Keep the handwriting unconnected by disabling joining substitutions.
+    "liga": False,
+    "clig": False,
+    "calt": False,
+    "kern": False,
+}
+
+XX_SIGNATURE_FEATURES = {
+    "liga": True,
+    "clig": True,
+    "calt": True,
+    "kern": False,
+}
 
 
 class ThankYouRequest(BaseModel):
@@ -52,14 +72,100 @@ def render_template_text(first_name: str):
     return lines
 
 
-def wrap_text(text: str, font_name: str, font_size: float, max_width: float):
+class OpenTypeTextRenderer:
+    def __init__(self, font_path: str):
+        with open(font_path, "rb") as font_file:
+            self.font_data = font_file.read()
+
+        self.face = hb.Face(self.font_data)
+        self.font = hb.Font(self.face)
+        hb.ot_font_set_funcs(self.font)
+        self.tt_font = OpenTypeFont(font_path)
+        self.glyph_set = self.tt_font.getGlyphSet()
+        self.units_per_em = self.tt_font["head"].unitsPerEm
+        self.font.scale = (self.units_per_em, self.units_per_em)
+
+    def shape(self, text: str, features=None):
+        buffer = hb.Buffer()
+        buffer.add_str(text)
+        buffer.direction = "ltr"
+        buffer.script = "Latn"
+        buffer.language = "en"
+        hb.shape(self.font, buffer, features or WORD_HANDWRITING_FEATURES)
+        return zip(buffer.glyph_infos, buffer.glyph_positions)
+
+    def text_width(self, text: str, font_size: float, features=None):
+        scale = font_size / self.units_per_em
+        return sum(
+            position.x_advance * scale
+            for _, position in self.shape(text, features=features)
+        )
+
+    def draw(self, c, text: str, x: float, y: float, font_size: float, features=None):
+        scale = font_size / self.units_per_em
+        cursor_x = 0
+
+        c.saveState()
+        c.setFillColorRGB(0, 0, 0)
+        c.translate(x, y)
+
+        for info, position in self.shape(text, features=features):
+            glyph_name = self.tt_font.getGlyphName(info.codepoint)
+            glyph = self.glyph_set[glyph_name]
+            glyph_x = cursor_x + position.x_offset * scale
+            glyph_y = position.y_offset * scale
+
+            c.saveState()
+            c.translate(glyph_x, glyph_y)
+            c.scale(scale, scale)
+            path = c.beginPath()
+            glyph.draw(ReportLabPathPen(self.glyph_set, path))
+            c.drawPath(path, fill=1, stroke=0)
+            c.restoreState()
+
+            cursor_x += position.x_advance * scale
+
+        c.restoreState()
+
+
+class ReportLabPathPen(BasePen):
+    def __init__(self, glyph_set, path):
+        super().__init__(glyph_set)
+        self.path = path
+
+    def _moveTo(self, point):
+        self.path.moveTo(*point)
+
+    def _lineTo(self, point):
+        self.path.lineTo(*point)
+
+    def _curveToOne(self, point1, point2, point3):
+        self.path.curveTo(*point1, *point2, *point3)
+
+    def _qCurveToOne(self, point1, point2):
+        point0 = self._getCurrentPoint()
+        curve1 = (
+            point0[0] + (2.0 / 3.0) * (point1[0] - point0[0]),
+            point0[1] + (2.0 / 3.0) * (point1[1] - point0[1]),
+        )
+        curve2 = (
+            point2[0] + (2.0 / 3.0) * (point1[0] - point2[0]),
+            point2[1] + (2.0 / 3.0) * (point1[1] - point2[1]),
+        )
+        self.path.curveTo(*curve1, *curve2, *point2)
+
+    def _closePath(self):
+        self.path.close()
+
+
+def wrap_text(text: str, font_size: float, max_width: float, text_width):
     words = text.split()
     lines = []
     current_line = ""
 
     for word in words:
         candidate = f"{current_line} {word}".strip()
-        if pdfmetrics.stringWidth(candidate, font_name, font_size) <= max_width:
+        if text_width(candidate, font_size) <= max_width:
             current_line = candidate
         else:
             if current_line:
@@ -73,13 +179,20 @@ def wrap_text(text: str, font_name: str, font_size: float, max_width: float):
 
 
 def draw_ark_footer(c, page_width: float):
-    c.setFillColorRGB(0, 0, 0)
-    c.setFont("Helvetica-Bold", 12)
-    c.drawCentredString(page_width / 2, 25.2, "ARK SWIMWEAR")
-    c.setFillColorRGB(0.45, 0.45, 0.45)
-    c.setFont("Helvetica-Bold", 4.5)
-    c.drawCentredString(page_width / 2, 17.3, "SYDNEY AUSTRALIA")
-    c.setFillColorRGB(0, 0, 0)
+    logo = ImageReader(ARK_LOGO)
+    image_width, image_height = logo.getSize()
+    display_width = 95
+    display_height = display_width * image_height / image_width
+    x = (page_width - display_width) / 2
+    c.drawImage(
+        logo,
+        x,
+        15,
+        width=display_width,
+        height=display_height,
+        mask="auto",
+        preserveAspectRatio=True,
+    )
 
 
 def create_thank_you_pdf(first_name: str, output_pdf_path: str):
@@ -89,6 +202,8 @@ def create_thank_you_pdf(first_name: str, output_pdf_path: str):
 
     if font_name not in pdfmetrics.getRegisteredFontNames():
         pdfmetrics.registerFont(TTFont(font_name, HANDWRITING_FONT))
+
+    handwriting = OpenTypeTextRenderer(HANDWRITING_FONT)
 
     template_lines = render_template_text(first_name)
     title = template_lines[0] if template_lines else f"Thank you {first_name}!"
@@ -100,24 +215,27 @@ def create_thank_you_pdf(first_name: str, output_pdf_path: str):
     c = canvas.Canvas(buffer, pagesize=(page_width, page_height))
     c.setTitle(f"Thank you {first_name}")
 
-    left_margin = 28.32
-    max_width = 490
+    left_margin = 10.32
+    max_width = 520.36
     font_size = 48.024
 
-    c.setFont(font_name, font_size)
-    c.drawString(left_margin, 300.22, title)
+    handwriting.draw(c, title, left_margin, 300.22, font_size)
 
     y = 250.27
     leading = 49.82
     for paragraph in body:
-        for line in wrap_text(paragraph, font_name, font_size, max_width):
-            c.drawString(left_margin, y, line)
+        for line in wrap_text(
+            paragraph,
+            font_size,
+            max_width,
+            handwriting.text_width,
+        ):
+            handwriting.draw(c, line, left_margin, y, font_size)
             y -= leading
 
     signature_size = 51.984
-    c.setFont(font_name, signature_size)
-    c.drawString(140.66, 49.2, "With love, Renée and the team")
-    c.drawString(472.9, 26.4, "xx")
+    handwriting.draw(c, "With love, Renée and the team", 140.66, 49.2, signature_size)
+    handwriting.draw(c, "xx", 472.9, 26.4, signature_size, features=XX_SIGNATURE_FEATURES)
     draw_ark_footer(c, page_width)
 
     c.save()
@@ -132,6 +250,7 @@ def create_thank_you_note(request: ThankYouRequest):
     first_name = get_first_name(request.name)
     require_file(TEMPLATE_DOCX, "Template DOCX")
     require_file(HANDWRITING_FONT, "Handwriting font")
+    require_file(ARK_LOGO, "Ark footer logo")
 
     output_filename = f"thank_you_{uuid4().hex}.pdf"
     output_path = os.path.join(OUTPUT_DIR, output_filename)
