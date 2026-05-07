@@ -181,7 +181,7 @@ def wrap_text(text: str, font_size: float, max_width: float, text_width):
 def draw_ark_footer(c, page_width: float):
     logo = ImageReader(ARK_LOGO)
     image_width, image_height = logo.getSize()
-    display_width = 95
+    display_width = 98
     display_height = display_width * image_height / image_width
     x = (page_width - display_width) / 2
     c.drawImage(
